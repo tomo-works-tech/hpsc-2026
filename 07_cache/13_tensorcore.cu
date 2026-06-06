@@ -42,28 +42,169 @@ __global__ void float_to_half_kernel(const float *__restrict__ src,
   }
 }
 
-// A: column-major, shape m x k, index A[col * m + row]
-// B: column-major, shape k x n, index B[col * k + row]
-// C: column-major, shape m x n, index C[col * m + row]
+// -----------------------------------------------------------------------------
+// Fast kernel
+// A: column-major, shape m x k, A[col * m + row]
+// B: column-major, shape k x n, B[col * k + row]
+// C: column-major, shape m x n, C[col * m + row]
 //
-// This version:
-// - BM=128, BN=128, BK=32
+// Method:
+// - BM=128, BN=128, BK=64
 // - 8 warps/block
-// - Each warp computes a 32 x 64 C tile = 2 x 4 WMMA fragments
-// - Compared with BK=16, synchronization frequency is reduced.
-// - Compared with BK=64, register pressure is lower.
+// - each warp computes 32 x 64
+// - B is stored in shared memory as Bs[n][k]
+// - WMMA matrix_b is loaded as col_major
+// - A and B global loads are vectorized by int4 = half x 8
+// -----------------------------------------------------------------------------
 template <int BM, int BN, int BK, int SKEW, int WARPS_PER_BLOCK>
 __global__ __launch_bounds__(WARPS_PER_BLOCK * 32, 2)
-void wmma_gemm_kernel(int dim_m, int dim_n, int dim_k,
-                      const half *__restrict__ A,
-                      const half *__restrict__ B,
-                      float *__restrict__ C) {
+void wmma_gemm_fast_kernel(int dim_m, int dim_n, int dim_k,
+                           const half *__restrict__ A,
+                           const half *__restrict__ B,
+                           float *__restrict__ C) {
+  constexpr int THREADS = WARPS_PER_BLOCK * 32;
+
+  static_assert(BM == 128 && BN == 128 && BK == 64,
+                "fast kernel is tuned for 128x128x64 tiles.");
+  static_assert(WARPS_PER_BLOCK == 8,
+                "fast kernel expects 8 warps/block.");
+
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+
+  const int block_m = blockIdx.x * BM;
+  const int block_n = blockIdx.y * BN;
+
+  // A is As[k][m]
+  // B is Bs[n][k]
+  __shared__ __align__(16) half As[BK][BM + SKEW];
+  __shared__ __align__(16) half Bs[BN][BK + SKEW];
+
+  const int warp_row = warp_id & 3;   // 0..3
+  const int warp_col = warp_id >> 2;  // 0..1
+
+  const int warp_m0 = warp_row * 32;
+  const int warp_n0 = warp_col * 64;
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
+
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      wmma::fill_fragment(acc[r][c], 0.0f);
+    }
+  }
+
+  for (int k0 = 0; k0 < dim_k; k0 += BK) {
+    // Load A tile by half8.
+    // A[gk * dim_m + gm] is contiguous in gm.
+    constexpr int A_VEC_PER_K = BM / 8;
+    constexpr int A_VEC_TOTAL = BM * BK / 8;
+
+    for (int v = tid; v < A_VEC_TOTAL; v += THREADS) {
+      const int kk = v / A_VEC_PER_K;
+      const int mm8 = (v - kk * A_VEC_PER_K) * 8;
+
+      const half *src =
+          A + static_cast<std::size_t>(k0 + kk) * dim_m + block_m + mm8;
+
+      half *dst = &As[kk][mm8];
+
+      *reinterpret_cast<int4 *>(dst) =
+          *reinterpret_cast<const int4 *>(src);
+    }
+
+    // Load B tile by half8.
+    // B[gn * dim_k + gk] is contiguous in gk.
+    // Store as Bs[n][k].
+    constexpr int B_VEC_PER_N = BK / 8;
+    constexpr int B_VEC_TOTAL = BN * BK / 8;
+
+    for (int v = tid; v < B_VEC_TOTAL; v += THREADS) {
+      const int nn = v / B_VEC_PER_N;
+      const int kk8 = (v - nn * B_VEC_PER_N) * 8;
+
+      const half *src =
+          B + static_cast<std::size_t>(block_n + nn) * dim_k + k0 + kk8;
+
+      half *dst = &Bs[nn][kk8];
+
+      *reinterpret_cast<int4 *>(dst) =
+          *reinterpret_cast<const int4 *>(src);
+    }
+
+    __syncthreads();
+
+#pragma unroll
+    for (int kk = 0; kk < BK; kk += 16) {
+      // Load B fragments once and reuse for r=0,1.
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, half,
+                     wmma::col_major> b_frag[4];
+
+#pragma unroll
+      for (int c = 0; c < 4; ++c) {
+        const int b_n = warp_n0 + c * 16;
+
+        wmma::load_matrix_sync(b_frag[c],
+                               &Bs[b_n][kk],
+                               BK + SKEW);
+      }
+
+#pragma unroll
+      for (int r = 0; r < 2; ++r) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half,
+                       wmma::col_major> a_frag;
+
+        const int a_m = warp_m0 + r * 16;
+
+        wmma::load_matrix_sync(a_frag,
+                               &As[kk][a_m],
+                               BM + SKEW);
+
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+          wmma::mma_sync(acc[r][c],
+                         a_frag,
+                         b_frag[c],
+                         acc[r][c]);
+        }
+      }
+    }
+
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      const int c_m = block_m + warp_m0 + r * 16;
+      const int c_n = block_n + warp_n0 + c * 16;
+
+      wmma::store_matrix_sync(&C[static_cast<std::size_t>(c_n) * dim_m + c_m],
+                              acc[r][c],
+                              dim_m,
+                              wmma::mem_col_major);
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Safe fallback kernel for arbitrary sizes.
+// -----------------------------------------------------------------------------
+template <int BM, int BN, int BK, int SKEW, int WARPS_PER_BLOCK>
+__global__ __launch_bounds__(WARPS_PER_BLOCK * 32, 2)
+void wmma_gemm_safe_kernel(int dim_m, int dim_n, int dim_k,
+                           const half *__restrict__ A,
+                           const half *__restrict__ B,
+                           float *__restrict__ C) {
   constexpr int THREADS = WARPS_PER_BLOCK * 32;
 
   static_assert(BM == 128 && BN == 128 && BK == 32,
-                "This kernel is tuned for 128x128x32 tiles.");
+                "safe kernel is tuned for 128x128x32 tiles.");
   static_assert(WARPS_PER_BLOCK == 8,
-                "This kernel expects 8 warps/block.");
+                "safe kernel expects 8 warps/block.");
 
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
@@ -72,14 +213,10 @@ void wmma_gemm_kernel(int dim_m, int dim_n, int dim_k,
   const int block_m = blockIdx.x * BM;
   const int block_n = blockIdx.y * BN;
 
-  __shared__ half As[BK][BM + SKEW];
-  __shared__ half Bs[BK][BN + SKEW];
-
+  __shared__ __align__(16) half As[BK][BM + SKEW];
+  __shared__ __align__(16) half Bs[BK][BN + SKEW];
   __shared__ float Cscratch[WARPS_PER_BLOCK][16 * 16];
 
-  // 8 warps/block:
-  // warp_row = 0..3, warp_col = 0..1
-  // each warp computes 32 x 64.
   const int warp_row = warp_id & 3;
   const int warp_col = warp_id >> 2;
 
@@ -97,7 +234,6 @@ void wmma_gemm_kernel(int dim_m, int dim_n, int dim_k,
   }
 
   for (int k0 = 0; k0 < dim_k; k0 += BK) {
-    // Load A tile: BM x BK into shared memory.
     for (int idx = tid; idx < BM * BK; idx += THREADS) {
       const int kk = idx / BM;
       const int mm = idx - kk * BM;
@@ -110,10 +246,6 @@ void wmma_gemm_kernel(int dim_m, int dim_n, int dim_k,
                        : __float2half(0.0f);
     }
 
-    // Load B tile: BK x BN into shared memory.
-    // B is column-major: B[gn * dim_k + gk].
-    // Therefore, consecutive gk values are contiguous in memory.
-    // This mapping makes consecutive threads read consecutive B elements.
     for (int idx = tid; idx < BN * BK; idx += THREADS) {
       const int nn = idx / BK;
       const int kk = idx - nn * BK;
@@ -122,16 +254,30 @@ void wmma_gemm_kernel(int dim_m, int dim_n, int dim_k,
       const int gk = k0 + kk;
 
       Bs[kk][nn] = (gn < dim_n && gk < dim_k)
-                      ? B[static_cast<std::size_t>(gn) * dim_k + gk]
-                      : __float2half(0.0f);
+                       ? B[static_cast<std::size_t>(gn) * dim_k + gk]
+                       : __float2half(0.0f);
     }
+
     __syncthreads();
 
 #pragma unroll
     for (int kk = 0; kk < BK; kk += 16) {
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, half,
+                     wmma::row_major> b_frag[4];
+
+#pragma unroll
+      for (int c = 0; c < 4; ++c) {
+        const int b_n = warp_n0 + c * 16;
+
+        wmma::load_matrix_sync(b_frag[c],
+                               &Bs[kk][b_n],
+                               BN + SKEW);
+      }
+
 #pragma unroll
       for (int r = 0; r < 2; ++r) {
-        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half,
+                       wmma::col_major> a_frag;
 
         const int a_m = warp_m0 + r * 16;
 
@@ -141,17 +287,9 @@ void wmma_gemm_kernel(int dim_m, int dim_n, int dim_k,
 
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
-          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-
-          const int b_n = warp_n0 + c * 16;
-
-          wmma::load_matrix_sync(b_frag,
-                                 &Bs[kk][b_n],
-                                 BN + SKEW);
-
           wmma::mma_sync(acc[r][c],
                          a_frag,
-                         b_frag,
+                         b_frag[c],
                          acc[r][c]);
         }
       }
@@ -248,48 +386,98 @@ static float time_cublas_gemm(cublasHandle_t handle, int Nt,
 
 static float time_my_gemm(int Nt, int m, int n, int k,
                           const half *Ah, const half *Bh, float *C2) {
-  constexpr int BM = 128;
-  constexpr int BN = 128;
-  constexpr int BK = 32;
-  constexpr int SKEW = 8;
-  constexpr int WARPS = 8;
-  constexpr int THREADS = WARPS * 32;
+  const bool use_fast =
+      (m % 128 == 0) &&
+      (n % 128 == 0) &&
+      (k % 64 == 0);
 
-  dim3 block(THREADS);
-  dim3 grid((m + BM - 1) / BM,
-            (n + BN - 1) / BN);
+  if (use_fast) {
+    constexpr int BM = 128;
+    constexpr int BN = 128;
+    constexpr int BK = 64;
+    constexpr int SKEW = 8;
+    constexpr int WARPS = 8;
+    constexpr int THREADS = WARPS * 32;
 
-  for (int i = 0; i < 2; ++i) {
-    wmma_gemm_kernel<BM, BN, BK, SKEW, WARPS>
-        <<<grid, block>>>(m, n, k, Ah, Bh, C2);
+    dim3 block(THREADS);
+    dim3 grid((m + BM - 1) / BM,
+              (n + BN - 1) / BN);
+
+    for (int i = 0; i < 2; ++i) {
+      wmma_gemm_fast_kernel<BM, BN, BK, SKEW, WARPS>
+          <<<grid, block>>>(m, n, k, Ah, Bh, C2);
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    CUDA_CHECK(cudaEventRecord(start));
+
+    for (int i = 0; i < Nt; ++i) {
+      wmma_gemm_fast_kernel<BM, BN, BK, SKEW, WARPS>
+          <<<grid, block>>>(m, n, k, Ah, Bh, C2);
+    }
+
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    CUDA_CHECK(cudaGetLastError());
+
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    return (ms * 1.0e-3f) / Nt;
+  } else {
+    constexpr int BM = 128;
+    constexpr int BN = 128;
+    constexpr int BK = 32;
+    constexpr int SKEW = 8;
+    constexpr int WARPS = 8;
+    constexpr int THREADS = WARPS * 32;
+
+    dim3 block(THREADS);
+    dim3 grid((m + BM - 1) / BM,
+              (n + BN - 1) / BN);
+
+    for (int i = 0; i < 2; ++i) {
+      wmma_gemm_safe_kernel<BM, BN, BK, SKEW, WARPS>
+          <<<grid, block>>>(m, n, k, Ah, Bh, C2);
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    CUDA_CHECK(cudaEventRecord(start));
+
+    for (int i = 0; i < Nt; ++i) {
+      wmma_gemm_safe_kernel<BM, BN, BK, SKEW, WARPS>
+          <<<grid, block>>>(m, n, k, Ah, Bh, C2);
+    }
+
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    CUDA_CHECK(cudaGetLastError());
+
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    return (ms * 1.0e-3f) / Nt;
   }
-
-  CUDA_CHECK(cudaGetLastError());
-  CUDA_CHECK(cudaDeviceSynchronize());
-
-  cudaEvent_t start, stop;
-  CUDA_CHECK(cudaEventCreate(&start));
-  CUDA_CHECK(cudaEventCreate(&stop));
-
-  CUDA_CHECK(cudaEventRecord(start));
-
-  for (int i = 0; i < Nt; ++i) {
-    wmma_gemm_kernel<BM, BN, BK, SKEW, WARPS>
-        <<<grid, block>>>(m, n, k, Ah, Bh, C2);
-  }
-
-  CUDA_CHECK(cudaEventRecord(stop));
-  CUDA_CHECK(cudaEventSynchronize(stop));
-
-  CUDA_CHECK(cudaGetLastError());
-
-  float ms = 0.0f;
-  CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-
-  CUDA_CHECK(cudaEventDestroy(start));
-  CUDA_CHECK(cudaEventDestroy(stop));
-
-  return (ms * 1.0e-3f) / Nt;
 }
 
 int main(int argc, char **argv) {
@@ -409,4 +597,3 @@ int main(int argc, char **argv) {
 
   return 0;
 }
-
