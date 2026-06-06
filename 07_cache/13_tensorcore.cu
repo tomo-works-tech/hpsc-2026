@@ -1,4 +1,3 @@
-// 13_tensorcore.cu
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -43,7 +42,40 @@ __global__ void float_to_half_kernel(const float *__restrict__ src,
 }
 
 // -----------------------------------------------------------------------------
-// Fast kernel
+// Lower-level cp.async helpers.
+// cp.async copies 16 bytes directly from global memory to shared memory.
+// -----------------------------------------------------------------------------
+__device__ __forceinline__ unsigned smem_u32addr(const void *ptr) {
+  unsigned addr;
+  asm volatile(
+      "{ .reg .u64 u64addr;\n"
+      "  cvta.to.shared.u64 u64addr, %1;\n"
+      "  cvt.u32.u64 %0, u64addr;\n"
+      "}\n"
+      : "=r"(addr)
+      : "l"(ptr));
+  return addr;
+}
+
+__device__ __forceinline__ void cp_async_16(void *smem_ptr,
+                                            const void *gmem_ptr) {
+  const unsigned saddr = smem_u32addr(smem_ptr);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+               :
+               : "r"(saddr), "l"(gmem_ptr));
+}
+
+__device__ __forceinline__ void cp_async_commit_group() {
+  asm volatile("cp.async.commit_group;" ::);
+}
+
+__device__ __forceinline__ void cp_async_wait_all() {
+  asm volatile("cp.async.wait_all;" ::);
+}
+
+// -----------------------------------------------------------------------------
+// Fast kernel with cp.async + double buffering.
+//
 // A: column-major, shape m x k, A[col * m + row]
 // B: column-major, shape k x n, B[col * k + row]
 // C: column-major, shape m x n, C[col * m + row]
@@ -54,20 +86,26 @@ __global__ void float_to_half_kernel(const float *__restrict__ src,
 // - each warp computes 32 x 64
 // - B is stored in shared memory as Bs[n][k]
 // - WMMA matrix_b is loaded as col_major
-// - A and B global loads are vectorized by int4 = half x 8
+// - As/Bs are double-buffered in dynamic shared memory
+// - global -> shared copies use cp.async
 // -----------------------------------------------------------------------------
 template <int BM, int BN, int BK, int SKEW, int WARPS_PER_BLOCK>
 __global__ __launch_bounds__(WARPS_PER_BLOCK * 32, 2)
-void wmma_gemm_fast_kernel(int dim_m, int dim_n, int dim_k,
-                           const half *__restrict__ A,
-                           const half *__restrict__ B,
-                           float *__restrict__ C) {
+void wmma_gemm_cpasync_kernel(int dim_m, int dim_n, int dim_k,
+                              const half *__restrict__ A,
+                              const half *__restrict__ B,
+                              float *__restrict__ C) {
   constexpr int THREADS = WARPS_PER_BLOCK * 32;
 
   static_assert(BM == 128 && BN == 128 && BK == 64,
-                "fast kernel is tuned for 128x128x64 tiles.");
+                "cp.async kernel is tuned for 128x128x64 tiles.");
   static_assert(WARPS_PER_BLOCK == 8,
-                "fast kernel expects 8 warps/block.");
+                "cp.async kernel expects 8 warps/block.");
+
+  constexpr int A_LD = BM + SKEW;
+  constexpr int B_LD = BK + SKEW;
+  constexpr int A_STAGE_ELEMS = BK * A_LD;
+  constexpr int B_STAGE_ELEMS = BN * B_LD;
 
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
@@ -75,10 +113,14 @@ void wmma_gemm_fast_kernel(int dim_m, int dim_n, int dim_k,
   const int block_m = blockIdx.x * BM;
   const int block_n = blockIdx.y * BN;
 
-  // A is As[k][m]
-  // B is Bs[n][k]
-  __shared__ __align__(16) half As[BK][BM + SKEW];
-  __shared__ __align__(16) half Bs[BN][BK + SKEW];
+  extern __shared__ int4 smem_vec[];
+  half *smem = reinterpret_cast<half *>(smem_vec);
+
+  // Layout:
+  //   As[2][BK][BM + SKEW]
+  //   Bs[2][BN][BK + SKEW]
+  half *As = smem;
+  half *Bs = As + 2 * A_STAGE_ELEMS;
 
   const int warp_row = warp_id & 3;   // 0..3
   const int warp_col = warp_id >> 2;  // 0..1
@@ -96,9 +138,8 @@ void wmma_gemm_fast_kernel(int dim_m, int dim_n, int dim_k,
     }
   }
 
-  for (int k0 = 0; k0 < dim_k; k0 += BK) {
-    // Load A tile by half8.
-    // A[gk * dim_m + gm] is contiguous in gm.
+  auto load_tile_async = [&](int stage, int k0) {
+    // A: copy half8 = 16 bytes.
     constexpr int A_VEC_PER_K = BM / 8;
     constexpr int A_VEC_TOTAL = BM * BK / 8;
 
@@ -109,15 +150,14 @@ void wmma_gemm_fast_kernel(int dim_m, int dim_n, int dim_k,
       const half *src =
           A + static_cast<std::size_t>(k0 + kk) * dim_m + block_m + mm8;
 
-      half *dst = &As[kk][mm8];
+      half *dst =
+          As + stage * A_STAGE_ELEMS + kk * A_LD + mm8;
 
-      *reinterpret_cast<int4 *>(dst) =
-          *reinterpret_cast<const int4 *>(src);
+      cp_async_16(dst, src);
     }
 
-    // Load B tile by half8.
-    // B[gn * dim_k + gk] is contiguous in gk.
-    // Store as Bs[n][k].
+    // B: copy half8 = 16 bytes.
+    // Global B is contiguous along k. Shared B is stored as Bs[n][k].
     constexpr int B_VEC_PER_N = BK / 8;
     constexpr int B_VEC_TOTAL = BN * BK / 8;
 
@@ -128,13 +168,29 @@ void wmma_gemm_fast_kernel(int dim_m, int dim_n, int dim_k,
       const half *src =
           B + static_cast<std::size_t>(block_n + nn) * dim_k + k0 + kk8;
 
-      half *dst = &Bs[nn][kk8];
+      half *dst =
+          Bs + stage * B_STAGE_ELEMS + nn * B_LD + kk8;
 
-      *reinterpret_cast<int4 *>(dst) =
-          *reinterpret_cast<const int4 *>(src);
+      cp_async_16(dst, src);
     }
 
-    __syncthreads();
+    cp_async_commit_group();
+  };
+
+  // Preload first tile.
+  int stage = 0;
+  load_tile_async(stage, 0);
+  cp_async_wait_all();
+  __syncthreads();
+
+  for (int k0 = 0; k0 < dim_k; k0 += BK) {
+    const int next_k0 = k0 + BK;
+    const int next_stage = stage ^ 1;
+
+    // Start loading the next K tile while computing the current tile.
+    if (next_k0 < dim_k) {
+      load_tile_async(next_stage, next_k0);
+    }
 
 #pragma unroll
     for (int kk = 0; kk < BK; kk += 16) {
@@ -146,9 +202,10 @@ void wmma_gemm_fast_kernel(int dim_m, int dim_n, int dim_k,
       for (int c = 0; c < 4; ++c) {
         const int b_n = warp_n0 + c * 16;
 
-        wmma::load_matrix_sync(b_frag[c],
-                               &Bs[b_n][kk],
-                               BK + SKEW);
+        wmma::load_matrix_sync(
+            b_frag[c],
+            Bs + stage * B_STAGE_ELEMS + b_n * B_LD + kk,
+            B_LD);
       }
 
 #pragma unroll
@@ -158,9 +215,10 @@ void wmma_gemm_fast_kernel(int dim_m, int dim_n, int dim_k,
 
         const int a_m = warp_m0 + r * 16;
 
-        wmma::load_matrix_sync(a_frag,
-                               &As[kk][a_m],
-                               BM + SKEW);
+        wmma::load_matrix_sync(
+            a_frag,
+            As + stage * A_STAGE_ELEMS + kk * A_LD + a_m,
+            A_LD);
 
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
@@ -172,7 +230,12 @@ void wmma_gemm_fast_kernel(int dim_m, int dim_n, int dim_k,
       }
     }
 
-    __syncthreads();
+    // Make sure next tile is available before moving to it.
+    if (next_k0 < dim_k) {
+      cp_async_wait_all();
+      __syncthreads();
+      stage = next_stage;
+    }
   }
 
 #pragma unroll
@@ -399,13 +462,31 @@ static float time_my_gemm(int Nt, int m, int n, int k,
     constexpr int WARPS = 8;
     constexpr int THREADS = WARPS * 32;
 
+    constexpr int A_LD = BM + SKEW;
+    constexpr int B_LD = BK + SKEW;
+    constexpr int A_STAGE_ELEMS = BK * A_LD;
+    constexpr int B_STAGE_ELEMS = BN * B_LD;
+    constexpr int SMEM_BYTES =
+        2 * (A_STAGE_ELEMS + B_STAGE_ELEMS) *
+        static_cast<int>(sizeof(half));
+
     dim3 block(THREADS);
     dim3 grid((m + BM - 1) / BM,
               (n + BN - 1) / BN);
 
+    CUDA_CHECK(cudaFuncSetAttribute(
+        wmma_gemm_cpasync_kernel<BM, BN, BK, SKEW, WARPS>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        SMEM_BYTES));
+
+    CUDA_CHECK(cudaFuncSetAttribute(
+        wmma_gemm_cpasync_kernel<BM, BN, BK, SKEW, WARPS>,
+        cudaFuncAttributePreferredSharedMemoryCarveout,
+        cudaSharedmemCarveoutMaxShared));
+
     for (int i = 0; i < 2; ++i) {
-      wmma_gemm_fast_kernel<BM, BN, BK, SKEW, WARPS>
-          <<<grid, block>>>(m, n, k, Ah, Bh, C2);
+      wmma_gemm_cpasync_kernel<BM, BN, BK, SKEW, WARPS>
+          <<<grid, block, SMEM_BYTES>>>(m, n, k, Ah, Bh, C2);
     }
 
     CUDA_CHECK(cudaGetLastError());
@@ -418,8 +499,8 @@ static float time_my_gemm(int Nt, int m, int n, int k,
     CUDA_CHECK(cudaEventRecord(start));
 
     for (int i = 0; i < Nt; ++i) {
-      wmma_gemm_fast_kernel<BM, BN, BK, SKEW, WARPS>
-          <<<grid, block>>>(m, n, k, Ah, Bh, C2);
+      wmma_gemm_cpasync_kernel<BM, BN, BK, SKEW, WARPS>
+          <<<grid, block, SMEM_BYTES>>>(m, n, k, Ah, Bh, C2);
     }
 
     CUDA_CHECK(cudaEventRecord(stop));
